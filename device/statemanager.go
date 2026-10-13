@@ -40,6 +40,9 @@ var timeNow = time.Now
 //
 // GetState is blocking and therefore should run in dedicated thread in a loop. After Close is called GetState will
 // return immediately with WireGuardDisabled.
+//
+// CurrentState returns the latest posted state without blocking on or polling stateChan. It may run ahead of
+// GetState. Before the first state change it is WireGuardDisabled (the zero value).
 type WireGuardStateManager struct {
 	HandshakeStateChan   chan HandshakeState
 	SocketErrChan        chan error
@@ -47,10 +50,11 @@ type WireGuardStateManager struct {
 	closeChan            chan bool
 
 	stateChan      chan WireGuardState
+	currentState   atomic.Int32
 	isNetAvailable atomic.Bool
 
-	lastRestart      time.Time
-	udpTransmission  bool
+	lastRestart     time.Time
+	udpTransmission bool
 
 	log              *Logger
 	mu               sync.Mutex
@@ -103,13 +107,17 @@ func (man *WireGuardStateManager) GetState() WireGuardState {
 	return state
 }
 
+func (man *WireGuardStateManager) CurrentState() WireGuardState {
+	return WireGuardState(man.currentState.Load())
+}
+
 func (man *WireGuardStateManager) Close() {
 	man.log.Verbosef("StateManager: closing")
 	man.closed.Store(true)
 	go func() {
 		man.closeChan <- true
 		man.stopping.Wait() // Wait for handlerLoop and all postState goroutines to finish.
-		man.stateChan <- WireGuardDisabled
+		man.pushState(WireGuardDisabled)
 		close(man.stateChan)
 	}()
 }
@@ -246,7 +254,12 @@ func (man *WireGuardStateManager) postState(state WireGuardState) {
 	go func() {
 		defer man.stopping.Done()
 		if !man.closed.Load() && (man.isNetAvailable.Load() || state == WireGuardWaitingForNetwork) {
-			man.stateChan <- state
+			man.pushState(state)
 		}
 	}()
+}
+
+func (man *WireGuardStateManager) pushState(state WireGuardState) {
+	man.currentState.Store(int32(state))
+	man.stateChan <- state
 }
